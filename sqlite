@@ -1,0 +1,621 @@
+import datetime
+import aiosqlite as sq
+from aiogram.utils.deep_linking import get_start_link
+import other
+from datetime import datetime
+import xml.etree.ElementTree as ET
+from urllib.request import urlopen
+from client_directory import client_ikb
+from create_bot import bot
+import openpyxl
+
+admin_group_id = ''
+
+
+async def db_start():
+    global db, cur
+
+    db = await sq.connect('data_base/data_base.db')
+    cur = await db.cursor()
+    await db.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id_in_db INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id_in_tg INTEGER,
+        username TEXT,
+        clear_balance TEXT,
+        current_balance TEXT,
+        number_of_referrals INTEGER,
+        time_of_registration TEXT,
+        payments_address TEXT
+        )""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS referrals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id_in_db INTEGER,
+        invited_user_id_in_db INTEGER
+        )""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS bidding(
+        bidding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id_in_db INTEGER,
+        result TEXT,
+        percent TEXT,
+        time TEXT,
+        balance_at_the_beginning TEXT,
+        balance_at_the_end TEXT
+        )""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS refills(
+        order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id_in_db INTEGER,
+        operation TEXT,
+        volume TEXT,
+        time TEXT,
+        balance_at_the_beginning TEXT,
+        balance_at_the_end TEXT
+        )""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS information_from_admin(
+        name TEXT,
+        content TEXT
+        )""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS message_object(
+        user_id TEXT, 
+        message_object TEXT, 
+        type_message TEXT)""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS balance_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_tg_id TEXT, 
+        balance INTEGER, 
+        date_of_balance_update TEXT)""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS bidding_history(
+        bidding_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        result TEXT,
+        percent TEXT,
+        time TEXT
+        )""")
+    await db.commit()
+    await SQLite.check_information_from_admin()
+
+
+class SQLite:
+    @staticmethod
+    async def make_record_about_new_finished_refills(user_id_in_db, volume, operation):
+        await SQLite.update_balance_after_finished_refills(user_id_in_db, volume, operation)
+        await SQLite.write_balance_history_for_user(user_id_in_db)
+        await SQLite.create_new_refills(user_id_in_db, volume, operation)
+        await SQLite.accrual_referral_bonus(user_id_in_db, volume)
+        await SQLite.update_client_statistics(user_id_in_db)
+
+    @staticmethod
+    async def make_record_about_new_bidding(result, percent):
+        user_id_in_db_list_non_zero_balance = await SQLite.select_user_id_in_db_list_with_non_zero_balance()
+        await SQLite.write_bidding_in_history(result, percent)
+        for user_id_in_db in user_id_in_db_list_non_zero_balance:
+            await SQLite.create_new_bidding(result, percent, user_id_in_db)
+
+    @staticmethod
+    async def create_new_bidding(result, percent, user_id_in_db):
+        balance_at_the_beginning = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        balance_at_the_end = await SQLite.change_balance_for_bidding(result, percent, balance_at_the_beginning)
+        await SQLite.update_current_balance_by_user_id_in_db(user_id_in_db, balance_at_the_end)
+        await SQLite.write_bidding(user_id_in_db, result, percent, balance_at_the_beginning, balance_at_the_end)
+        await SQLite.update_client_statistics(user_id_in_db)
+        await SQLite.write_balance_history_for_user(user_id_in_db)
+
+    @staticmethod
+    async def make_record_about_new_referral(user_id_in_db, invited_user_id_in_tg):
+        check_conditions = await SQLite.check_conditions_for_make_record_about_new_referral(invited_user_id_in_tg, user_id_in_db)
+        if check_conditions is True:
+            invited_user_id_in_db = await SQLite.select_user_id_in_db_by_user_id_in_tg(invited_user_id_in_tg)
+            await SQLite.write_referrals(user_id_in_db, invited_user_id_in_db)
+            await SQLite.update_number_of_referrals_for_user_id_in_db(user_id_in_db)
+            await SQLite.update_client_statistics(user_id_in_db)
+
+    @staticmethod
+    async def decrease_current_balance_by_user_id_in_db(user_id_in_db, volume_for_withdrawal):
+        current_balance = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        if float(volume_for_withdrawal) > float(current_balance):
+            return False
+
+        await SQLite.write_balance_history_for_user(user_id_in_db)
+        await SQLite.make_decrease_current_balance_by_user_id_in_db(user_id_in_db, volume_for_withdrawal)
+        await SQLite.update_client_statistics(user_id_in_db)
+        return True
+
+    @staticmethod
+    async def update_balance_after_finished_refills(user_id_in_db, volume, operation):
+        await SQLite.update_clear_balance_after_finished_refills(user_id_in_db, volume, operation)
+        await SQLite.update_current_balance_after_finished_refills(user_id_in_db, volume, operation)
+
+    @staticmethod
+    async def check_information_from_admin():
+        availability_of_records = await SQLite.check_availability_of_records_information_from_admin()
+        if availability_of_records is False:
+            await SQLite.init_default_information_from_admin()
+
+    @staticmethod
+    async def update_client_statistics(user_id_in_db):
+        current_balance = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        round_current_balance = round(float(current_balance), 5)
+        number_of_referrals = await SQLite.select_number_of_referrals_by_user_id_in_db(user_id_in_db)
+        link = await get_start_link(str(user_id_in_db), encode=True)
+        total_volume_currency_of_referrals = await SQLite.select_total_volume_currency_of_referrals(user_id_in_db)
+        wallet_text = await other.get_main_wallet_text(round_current_balance, number_of_referrals, link, total_volume_currency_of_referrals)
+        await SQLite.change_wallet_text(user_id_in_db, wallet_text)
+
+    @staticmethod
+    async def select_total_volume_currency_of_referrals(user_id_in_db):
+        all_id_referrals_list = await SQLite.select_all_invited_users_id_in_db_by_user_id_in_db(user_id_in_db)
+        total_volume = 0
+        for referral_id_in_db in all_id_referrals_list:
+            volume_currency = await SQLite.select_list_amount_contributions_for_user_id_in_db(referral_id_in_db)
+            total_volume += sum(volume_currency)
+
+        return total_volume
+
+    @staticmethod
+    async def init_default_information_from_admin():
+        default_information_dict = other.default_information_from_admin_dict
+        for name in default_information_dict:
+            content = default_information_dict[name]
+            await SQLite.record_information_from_admin(name, content)
+
+    @staticmethod
+    async def select_list_amount_contributions_for_user_id_in_db(user_id_in_db):
+        all_refills = await SQLite.select_all_refills_by_user_id_in_db(user_id_in_db)
+        amount_contributions_list = [float(contribution[3]) for contribution in all_refills
+                                     if contribution[2] == 'replenishment']
+        return amount_contributions_list
+
+    @staticmethod
+    async def select_list_amount_conclusions_for_user_id_in_db(user_id_in_db):
+        all_refills = await SQLite.select_all_refills_by_user_id_in_db(user_id_in_db)
+        amount_conclusions_list = [float(conclusion[3]) for conclusion in all_refills
+                                     if conclusion[2] == 'withdrawal']
+        return amount_conclusions_list
+
+    @staticmethod
+    async def accrual_referral_bonus(user_id_in_db, volume):
+        refer_id_in_db = await SQLite.select_parent_user_referral_by_user_id_in_db(user_id_in_db)
+        if refer_id_in_db is not False:
+            await SQLite.adding_balance_for_refer_by_user_id_in_db(refer_id_in_db, volume)
+            await SQLite.update_client_statistics(refer_id_in_db)
+
+    @staticmethod
+    async def make_record_about_new_user(user_id, user_name):
+        check_record = await SQLite.select_user_id_in_db_by_user_id_in_tg(user_id)
+        if check_record is False:
+            await SQLite.write_new_user(user_id, user_name)
+            return True
+
+        else:
+            return False
+
+    @staticmethod
+    async def check_conditions_for_make_record_about_new_referral(invited_user_id_in_tg, user_id_in_db):
+        invited_user_id_in_db = await SQLite.select_user_id_in_db_by_user_id_in_tg(invited_user_id_in_tg)
+        check_record_referral = await SQLite.select_parent_user_referral_by_user_id_in_db(invited_user_id_in_db)
+        check_record_about_user = await SQLite.select_info_about_user_by_user_id_in_db(user_id_in_db)
+        check_record_about_invited_user = await SQLite.select_info_about_user_by_user_id_in_db(invited_user_id_in_db)
+        # Проверка на то, чтобы реферал и рефер не были одним и тем же аккаунтом
+        if int(user_id_in_db) == int(invited_user_id_in_db):
+            return False
+
+        # Проверка не был ли реферал записан ранее
+        if check_record_referral is not False:
+            return False
+
+        if check_record_about_user is False:
+            return False
+
+        return True
+
+    @staticmethod
+    async def make_decrease_current_balance_by_user_id_in_db(user_id_in_db, volume_for_withdrawal):
+        current_balance = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        new_current_balance = float(current_balance) - float(volume_for_withdrawal)
+        await SQLite.update_current_balance_by_user_id_in_db(user_id_in_db, new_current_balance)
+        await SQLite.write_refills(user_id_in_db, current_balance, new_current_balance, volume_for_withdrawal,
+                                   'withdrawal')
+
+    @staticmethod
+    async def create_new_refills(user_id_in_db, volume, operation):
+        balance_at_the_beginning = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        balance_at_the_end = await SQLite.change_balance_for_refill(operation, volume, balance_at_the_beginning)
+        await SQLite.write_refills(user_id_in_db, balance_at_the_beginning, balance_at_the_end, volume, operation)
+
+    @staticmethod
+    async def change_balance_for_bidding(result, percent, balance_at_the_beginning):
+        balance_at_the_end = balance_at_the_beginning
+        if result == 'profit':
+            balance_at_the_end = float(balance_at_the_beginning) * (1 + float(percent)/100)
+
+        elif result == 'loss':
+            balance_at_the_end = float(balance_at_the_beginning) * (1 - float(percent) / 100)
+
+        else:
+            print('Неизвестный результат торгов!')
+
+        return balance_at_the_end
+
+    @staticmethod
+    async def change_balance_for_refill(operation, volume, balance_at_the_beginning):
+        balance_at_the_end = balance_at_the_beginning
+        if operation == 'replenishment':
+            balance_at_the_end = float(balance_at_the_beginning) + float(volume)
+
+        elif operation == 'withdrawal':
+            balance_at_the_end = float(balance_at_the_beginning) - float(volume)
+
+        else:
+            print('Неизвестный результат ввода/вывода!')
+
+        return balance_at_the_end
+
+    @staticmethod
+    async def change_wallet_text(user_id_in_db, wallet_text):
+        user_id_in_tg = await SQLite.select_user_id_in_tg_by_user_id_in_db(user_id_in_db)
+        msg_id = await SQLite.loads_message_object_from_data_base(user_id_in_tg, 'wallet')
+        try:
+            await bot.edit_message_text(chat_id=user_id_in_tg,
+                                        message_id=msg_id,
+                                        text=wallet_text,
+                                        reply_markup=await client_ikb.personal_account_ikb(user_id_in_db),
+                                        parse_mode='HTML')
+        except:
+            print('ошибка изменения текста')
+
+    @staticmethod
+    async def select_info_about_all_sessions_by_limit():
+        all_bidding = await SQLite.select_all_bidding()
+        if len(all_bidding) == 0:
+            return 0
+        limit = await SQLite.select_content_from_information_from_admin_by_name('report limit')
+        all_sessions_by_limit = []
+        for idx, bidding in enumerate(all_bidding[::-1]):
+            if idx > int(limit):
+                break
+            all_sessions_by_limit.append(bidding)
+
+        return all_sessions_by_limit
+
+    @staticmethod
+    async def update_number_of_referrals_for_user_id_in_db(user_id_in_db):
+        old_number_of_referrals = await SQLite.select_number_of_referrals_by_user_id_in_db(user_id_in_db)
+        current_number_of_referrals = len(
+            await SQLite.select_all_invited_users_id_in_db_by_user_id_in_db(user_id_in_db))
+        if old_number_of_referrals != current_number_of_referrals:
+            await SQLite.update_number_of_referrals_by_user_id_in_db(user_id_in_db, current_number_of_referrals)
+
+
+
+    @staticmethod
+    async def update_clear_balance_after_finished_refills(user_id_in_db, volume, operation):
+        clear_balance_at_the_beginning = await SQLite.select_clear_balance_by_user_id_in_db(user_id_in_db)
+        clear_balance_at_the_end = await SQLite.change_balance_for_refill(operation, volume,
+                                                                          clear_balance_at_the_beginning)
+        await SQLite.update_clear_balance_by_user_id_in_db(user_id_in_db, clear_balance_at_the_end)
+
+    @staticmethod
+    async def update_current_balance_after_finished_refills(user_id_in_db, volume, operation):
+        balance_at_the_beginning = await SQLite.select_current_balance_by_user_id_in_db(user_id_in_db)
+        balance_at_the_end = await SQLite.change_balance_for_refill(operation, volume, balance_at_the_beginning)
+        await SQLite.update_current_balance_by_user_id_in_db(user_id_in_db, balance_at_the_end)
+
+    @staticmethod
+    async def select_user_id_in_db_list_with_non_zero_balance():
+        user_id_in_db_list = await SQLite.select_all_users()
+        user_id_in_db_list_non_zero_balance = [user[0] for user in user_id_in_db_list if float(user[4]) > 0]
+        return user_id_in_db_list_non_zero_balance
+
+    @staticmethod
+    async def adding_balance_for_refer_by_user_id_in_db(refer_id_in_db, volume):
+        referral_bonus = await SQLite.select_content_from_information_from_admin_by_name(name='referral bonus')
+        volume_bonus = float(volume) * float(referral_bonus) / 100
+        old_balance = await SQLite.select_current_balance_by_user_id_in_db(refer_id_in_db)
+        new_balance = float(old_balance) + float(volume_bonus)
+        await SQLite.update_current_balance_by_user_id_in_db(refer_id_in_db, new_balance)
+
+    @staticmethod
+    async def write_balance_history_for_user(user_id_in_db):
+        user_info = await SQLite.select_info_about_user_by_user_id_in_db(user_id_in_db)
+        await SQLite.add_balance_record(user_info)
+
+    @staticmethod
+    async def select_dollar_exchange_rate():
+        with urlopen("https://www.cbr.ru/scripts/XML_daily.asp", timeout=10) as r:
+            course = (ET.parse(r).findtext('.//Valute[@ID="R01235"]/Value'))
+            course = course.replace(',', '.')
+            return course
+
+    @staticmethod
+    async def select_all_users():
+        cursor = await cur.execute(f"SELECT * FROM users")
+        data = await cursor.fetchall()
+        info_about_users = [user_info for user_info in data]
+        return info_about_users
+
+    # Методы SELECT таблицы users
+    @staticmethod
+    async def select_info_about_user_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT * FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        info_about_user = [user_info for user_info in data]
+        if len(info_about_user) == 0:
+            return False
+        return info_about_user[0]
+
+    @staticmethod
+    async def select_user_id_in_db_by_user_id_in_tg(user_id_in_tg):
+        cursor = await cur.execute(f"SELECT user_id_in_db FROM users WHERE user_id_in_tg = '{user_id_in_tg}'")
+        data = await cursor.fetchall()
+        user_id_in_db = [user_id[0] for user_id in data]
+        if len(user_id_in_db) == 0:
+            return False
+        return user_id_in_db[0]
+
+    @staticmethod
+    async def select_user_id_in_tg_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT user_id_in_tg FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        user_id_in_tg = [user_id[0] for user_id in data]
+        return user_id_in_tg[0]
+
+    @staticmethod
+    async def select_username_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT username FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        username = [username[0] for username in data]
+        return username[0]
+
+    @staticmethod
+    async def select_clear_balance_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT clear_balance FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        clear_balance = [clear_balance[0] for clear_balance in data]
+        return clear_balance[0]
+
+    @staticmethod
+    async def select_current_balance_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT current_balance FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        current_balance = [current_balance[0] for current_balance in data]
+        return current_balance[0]
+
+    @staticmethod
+    async def select_number_of_referrals_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(
+                                f"SELECT number_of_referrals FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        number_of_referrals = [number_of_referrals[0] for number_of_referrals in data]
+        return number_of_referrals[0]
+
+    # Методы SELECT таблицы referrals
+    @staticmethod
+    async def select_all_invited_users_id_in_db_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(
+                                f"SELECT invited_user_id_in_db FROM referrals WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        all_invited_users = [invited_user_id_in_db[0] for invited_user_id_in_db in data]
+        return all_invited_users
+
+    @staticmethod
+    async def select_parent_user_referral_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(
+                                f"SELECT user_id_in_db FROM referrals WHERE invited_user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        parent_user_id_in_db = [invited_user_id_in_db[0] for invited_user_id_in_db in data]
+        if len(parent_user_id_in_db) == 0:
+            return False
+        return parent_user_id_in_db[0]
+
+    # Методы SELECT таблицы bidding
+    @staticmethod
+    async def select_all_bidding_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT * FROM bidding WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        bidding_matrix = [bidding for bidding in data]
+        return bidding_matrix
+
+    @staticmethod
+    async def select_all_bidding():
+        cursor = await cur.execute(
+                              f"SELECT * FROM bidding_history")
+        data = await cursor.fetchall()
+        bidding_matrix = [bidding for bidding in data]
+        return bidding_matrix
+
+    # Методы SELECT таблицы refills
+    @staticmethod
+    async def select_all_refills_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(
+                                f"SELECT * FROM refills WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        refills_matrix = [refill for refill in data]
+        return refills_matrix
+
+    # Методы SELECT таблицы information_from_admin
+    @staticmethod
+    async def select_content_from_information_from_admin_by_name(name):
+        cursor = await cur.execute(
+                    f"SELECT content FROM information_from_admin WHERE name = '{name}'")
+        data = await cursor.fetchall()
+        content = [content[0] for content in data]
+
+        return content[0]
+
+    # Методы UPDATE/INSERT INTO
+    @staticmethod
+    async def check_availability_of_records_information_from_admin():
+        cursor = await cur.execute(f"SELECT * FROM information_from_admin")
+        data = await cursor.fetchall()
+        content = [content[0] for content in data]
+        if len(content) != 0:
+            return True
+        else:
+            return False
+
+    @staticmethod
+    async def record_information_from_admin(name, content):
+        await cur.execute("INSERT INTO information_from_admin(name, content) VALUES (?, ?)", (name, content))
+        await db.commit()
+
+    @staticmethod
+    async def update_information_from_admin(name, content):
+        await cur.execute(f"UPDATE information_from_admin SET content = '{content}' WHERE name = '{name}'")
+        await db.commit()
+
+    @staticmethod
+    async def write_new_user(user_id_in_tg, username):
+        clear_balance = 0
+        current_balance = 0
+        number_of_referrals = 0
+        time = datetime.now()
+        await cur.execute("INSERT INTO users(user_id_in_tg, username, time_of_registration, clear_balance, current_balance, number_of_referrals) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id_in_tg, username, time, clear_balance, current_balance, number_of_referrals))
+        await db.commit()
+
+    @staticmethod
+    async def write_referrals(user_id_in_db, invited_user_id_in_db):
+        await cur.execute("INSERT INTO referrals(user_id_in_db, invited_user_id_in_db) VALUES (?, ?)",
+                    (user_id_in_db, invited_user_id_in_db))
+        await db.commit()
+
+    @staticmethod
+    async def write_bidding(user_id_in_db, result, percent, balance_at_the_beginning, balance_at_the_end):
+        time = str(datetime.now())
+        await cur.execute("INSERT INTO bidding(user_id_in_db, result, percent, time, balance_at_the_beginning, balance_at_the_end) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id_in_db, result, percent, time, balance_at_the_beginning, balance_at_the_end))
+        await db.commit()
+
+    @staticmethod
+    async def write_refills(user_id_in_db, balance_at_the_beginning, balance_at_the_end, volume, operation):
+        time = str(datetime.now())
+        await cur.execute("INSERT INTO refills(user_id_in_db, operation, volume, time, balance_at_the_beginning, balance_at_the_end) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id_in_db, operation, volume, time, balance_at_the_beginning, balance_at_the_end))
+        await db.commit()
+
+    @staticmethod
+    async def update_current_balance_by_user_id_in_db(user_id_in_db, balance_at_the_end):
+        await cur.execute(
+            f"UPDATE users SET current_balance = '{balance_at_the_end}' WHERE user_id_in_db = '{user_id_in_db}'")
+        await db.commit()
+
+    @staticmethod
+    async def update_clear_balance_by_user_id_in_db(user_id_in_db, balance_at_the_end):
+        await cur.execute(
+            f"UPDATE users SET clear_balance = '{balance_at_the_end}' WHERE user_id_in_db = '{user_id_in_db}'")
+        await db.commit()
+
+    @staticmethod
+    async def update_number_of_referrals_by_user_id_in_db(user_id_in_db, number_of_referrals):
+        await cur.execute(
+            f"UPDATE users SET number_of_referrals = '{number_of_referrals}' WHERE user_id_in_db = '{user_id_in_db}'")
+        await db.commit()
+
+    @staticmethod
+    # Сохраняем объект сообщения в базу данных
+    async def dumps_message_object_in_data_base(user_id, message_object_id, type_message):
+        cursor = await cur.execute(
+            f"""SELECT message_object FROM message_object 
+            WHERE user_id = '{user_id}' AND type_message = '{type_message}'""")
+        data = await cursor.fetchall()
+        check_record = [check[0] for check in data]
+        if check_record:
+            await cur.execute(
+                f"""UPDATE message_object SET message_object = '{message_object_id}' 
+                WHERE user_id = '{user_id}' AND type_message = '{type_message}'""")
+
+        else:
+            await cur.execute("INSERT INTO message_object VALUES (?, ?, ?)",
+                        (user_id, message_object_id, type_message))
+        await db.commit()
+
+    @staticmethod
+    # Берем id сообщения по user_id и типу сообщения пример - 'review'
+    async def loads_message_object_from_data_base(user_id, type_message):
+        cursor = await cur.execute(f"SELECT message_object FROM message_object WHERE user_id = '{user_id}' AND type_message = '{type_message}'")
+        data = await cursor.fetchall()
+        message_object = [obj[0] for obj in data]
+        if len(message_object) == 0:
+            return False
+        return message_object[0]
+
+    @staticmethod
+    async def select_all_user_id_in_tg():
+        cursor = await cur.execute(f"SELECT user_id_in_tg FROM users")
+        data = await cursor.fetchall()
+        all_user_id_in_tg_list = [user_id_in_tg[0] for user_id_in_tg in data]
+        return set(all_user_id_in_tg_list)
+
+    @staticmethod
+    async def select_payments_address_by_user_id_in_db(user_id_in_db):
+        cursor = await cur.execute(f"SELECT payments_address FROM users WHERE user_id_in_db = '{user_id_in_db}'")
+        data = await cursor.fetchall()
+        payments_address = [payments_address[0] for payments_address in data]
+        return payments_address[0]
+
+    @staticmethod
+    async def delete_payments_address_for_user(user_id_in_db):
+        await cur.execute(
+            f"UPDATE users SET payments_address = '{None}' WHERE user_id_in_db = '{user_id_in_db}'")
+        await db.commit()
+
+    @staticmethod
+    async def write_payments_address_for_user(user_id_in_db, payments_address):
+        await cur.execute(
+            f"UPDATE users SET payments_address = '{payments_address}' WHERE user_id_in_db = '{user_id_in_db}'")
+        await db.commit()
+
+
+    #balance_history table, created by Anton
+    @staticmethod
+    async def select_last_10_balance_history_by_user_tg_id(user_tg_id):
+        cursor = await db.execute("""
+            SELECT * 
+            FROM balance_history 
+            WHERE user_tg_id = ? 
+            ORDER BY id DESC 
+            LIMIT 10
+        """, (user_tg_id,))
+        data = await cursor.fetchall()
+        return data
+
+    @staticmethod
+    async def add_balance_record(user_info):
+        user_tg_id = user_info[1]
+        balance = user_info[4]
+        date_of_balance_update = datetime.now().strftime("%d.%m.%Y")
+
+        await db.execute("""
+            INSERT INTO balance_history (user_tg_id, balance, date_of_balance_update)
+            VALUES (?, ?, ?)
+        """, (user_tg_id, balance, date_of_balance_update))
+        await db.commit()
+
+    @staticmethod
+    async def write_bidding_in_history(result, percent):
+        await cur.execute("INSERT INTO bidding_history (result, percent, time) VALUES (?, ?, ?)", (result, percent, str(datetime.now())))
+        await db.commit()
+
+    @staticmethod
+    async def load_data_base():
+        await cur.execute("SELECT * FROM users")
+        results = await cur.fetchall()
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        # Записываем заголовки столбцов
+        headers = ['id', 'Имя пользователя', 'Количество приглашенных пользователей', 'Текущий баланс', 'Инвестировано', 'Количество транзакций ввода', 'Выведено', 'Количество транзакций вывода']
+        worksheet.append(headers)
+        # Записываем данные из таблицы
+        for row in results:
+            user_id_in_db = row[0]
+            username = row[2]
+            current_balance = float(row[4])
+            number_of_referrals = row[5]
+            replenishment_list = await SQLite.select_list_amount_contributions_for_user_id_in_db(user_id_in_db)
+            replenishment_volume = round(sum(replenishment_list), 2)
+            replenishment_count = len(replenishment_list)
+            conclusions_list = await SQLite.select_list_amount_conclusions_for_user_id_in_db(user_id_in_db)
+            conclusions_volume = round(sum(conclusions_list), 2)
+            conclusions_count = len(conclusions_list)
+            print((user_id_in_db, round(current_balance, 2), replenishment_volume, replenishment_count, conclusions_volume, conclusions_count))
+            worksheet.append((user_id_in_db, username, number_of_referrals, round(current_balance, 2), replenishment_volume, replenishment_count, conclusions_volume, conclusions_count))
+        # Сохраняем файл
+        workbook.save('statistic.xlsx')
